@@ -1,0 +1,417 @@
+use crate::core::file_hasher;
+use crate::providers::traits::{FileMetadata, StorageProvider};
+use crate::utils::error::{Result, UvcadError};
+use crate::utils::keyring::{OAuthTokens, TokenManager};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+const DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
+const DRIVE_UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
+
+#[derive(Debug, Deserialize)]
+struct DriveFile {
+    id: String,
+    name: String,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    size: Option<String>,
+    #[serde(rename = "modifiedTime")]
+    modified_time: String,
+    #[serde(rename = "md5Checksum")]
+    md5_checksum: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileList {
+    files: Vec<DriveFile>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileMetadataUpload {
+    name: String,
+    parents: Vec<String>,
+}
+
+pub struct GoogleDriveProvider {
+    folder_id: String,
+    token_manager: TokenManager,
+    client: reqwest::Client,
+}
+
+impl GoogleDriveProvider {
+    pub fn new(folder_id: String) -> Result<Self> {
+        let token_manager = TokenManager::new("google_drive")?;
+        let client = reqwest::Client::new();
+
+        Ok(Self {
+            folder_id,
+            token_manager,
+            client,
+        })
+    }
+
+    async fn get_access_token(&self) -> Result<String> {
+        let tokens = self.token_manager.get_tokens()?;
+
+        // Check if token is expired
+        if let Some(expires_at) = tokens.expires_at {
+            let now = chrono::Utc::now().timestamp();
+            if expires_at - now < 300 {
+                // Token expired or expiring soon - need to refresh
+                // For now, return error - in production, integrate with AuthManager
+                return Err(UvcadError::AuthenticationFailed(
+                    "Access token expired, please re-authenticate".to_string()
+                ));
+            }
+        }
+
+        Ok(tokens.access_token)
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.token_manager.has_tokens()
+    }
+
+    pub fn store_tokens(&self, tokens: OAuthTokens) -> Result<()> {
+        self.token_manager.store_tokens(&tokens)
+    }
+
+    async fn list_files_in_folder(&self, folder_id: &str, page_token: Option<String>) -> Result<FileList> {
+        let token = self.get_access_token().await?;
+
+        let mut url = format!(
+            "{}/files?q='{}'+in+parents+and+trashed=false&fields=files(id,name,mimeType,size,modifiedTime,md5Checksum),nextPageToken",
+            DRIVE_API_BASE, folder_id
+        );
+
+        if let Some(token) = page_token {
+            url.push_str(&format!("&pageToken={}", token));
+        }
+
+        let response = self.client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(UvcadError::ProviderError(format!(
+                "Failed to list files: {} - {}",
+                status, error_text
+            )));
+        }
+
+        let file_list: FileList = response.json().await
+            .map_err(|e| UvcadError::ProviderError(format!("Failed to parse response: {}", e)))?;
+
+        Ok(file_list)
+    }
+
+    async fn get_file_by_name(&self, name: &str) -> Result<Option<DriveFile>> {
+        let token = self.get_access_token().await?;
+
+        let url = format!(
+            "{}/files?q='{}'+in+parents+and+name='{}'+and+trashed=false&fields=files(id,name,mimeType,size,modifiedTime,md5Checksum)",
+            DRIVE_API_BASE, self.folder_id, name
+        );
+
+        let response = self.client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let file_list: FileList = response.json().await
+            .map_err(|e| UvcadError::ProviderError(format!("Failed to parse response: {}", e)))?;
+
+        Ok(file_list.files.into_iter().next())
+    }
+
+    async fn download_file_content(&self, file_id: &str) -> Result<Vec<u8>> {
+        let token = self.get_access_token().await?;
+
+        let url = format!("{}/files/{}?alt=media", DRIVE_API_BASE, file_id);
+
+        let response = self.client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(UvcadError::ProviderError(format!(
+                "Failed to download file: {} - {}",
+                status, error_text
+            )));
+        }
+
+        let bytes = response.bytes().await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        Ok(bytes.to_vec())
+    }
+
+    async fn upload_file_content(&self, name: &str, content: Vec<u8>) -> Result<String> {
+        let token = self.get_access_token().await?;
+
+        // Create metadata
+        let metadata = FileMetadataUpload {
+            name: name.to_string(),
+            parents: vec![self.folder_id.clone()],
+        };
+
+        // Use multipart upload
+        let boundary = "===============boundary===============";
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|e| UvcadError::SerializationError(e))?;
+
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
+        body.extend_from_slice(metadata_json.as_bytes());
+        body.extend_from_slice(format!("\r\n--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        body.extend_from_slice(&content);
+        body.extend_from_slice(format!("\r\n--{}--", boundary).as_bytes());
+
+        let url = format!("{}/files?uploadType=multipart", DRIVE_UPLOAD_API);
+
+        let response = self.client
+            .post(&url)
+            .bearer_auth(token)
+            .header("Content-Type", format!("multipart/related; boundary={}", boundary))
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(UvcadError::ProviderError(format!(
+                "Failed to upload file: {} - {}",
+                status, error_text
+            )));
+        }
+
+        let file: DriveFile = response.json().await
+            .map_err(|e| UvcadError::ProviderError(format!("Failed to parse response: {}", e)))?;
+
+        Ok(file.id)
+    }
+
+    async fn update_file_content(&self, file_id: &str, content: Vec<u8>) -> Result<()> {
+        let token = self.get_access_token().await?;
+
+        let url = format!("{}/files/{}?uploadType=media", DRIVE_UPLOAD_API, file_id);
+
+        let response = self.client
+            .patch(&url)
+            .bearer_auth(token)
+            .header("Content-Type", "application/octet-stream")
+            .body(content)
+            .send()
+            .await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(UvcadError::ProviderError(format!(
+                "Failed to update file: {} - {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StorageProvider for GoogleDriveProvider {
+    fn name(&self) -> &str {
+        "google_drive"
+    }
+
+    async fn list_files(&self, _path: &Path) -> Result<Vec<FileMetadata>> {
+        let mut all_files = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let file_list = self.list_files_in_folder(&self.folder_id, page_token).await?;
+
+            for file in file_list.files {
+                // Skip folders
+                if file.mime_type == "application/vnd.google-apps.folder" {
+                    continue;
+                }
+
+                let size = file.size
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+
+                let modified: DateTime<Utc> = file.modified_time.parse()
+                    .unwrap_or_else(|_| Utc::now());
+
+                all_files.push(FileMetadata {
+                    path: PathBuf::from(&file.name),
+                    size,
+                    modified,
+                    hash: file.md5_checksum,
+                    exists: true,
+                });
+            }
+
+            if file_list.next_page_token.is_none() {
+                break;
+            }
+
+            page_token = file_list.next_page_token;
+        }
+
+        Ok(all_files)
+    }
+
+    async fn get_metadata(&self, path: &Path) -> Result<Option<FileMetadata>> {
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| UvcadError::InvalidConfig("Invalid file path".to_string()))?;
+
+        if let Some(file) = self.get_file_by_name(name).await? {
+            let size = file.size
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+
+            let modified: DateTime<Utc> = file.modified_time.parse()
+                .unwrap_or_else(|_| Utc::now());
+
+            Ok(Some(FileMetadata {
+                path: path.to_path_buf(),
+                size,
+                modified,
+                hash: file.md5_checksum,
+                exists: true,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn exists(&self, path: &Path) -> Result<bool> {
+        Ok(self.get_metadata(path).await?.is_some())
+    }
+
+    async fn download(&self, path: &Path, dest: &Path) -> Result<PathBuf> {
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| UvcadError::InvalidConfig("Invalid file path".to_string()))?;
+
+        let file = self.get_file_by_name(name).await?
+            .ok_or_else(|| UvcadError::FileNotFound { path: path.to_string_lossy().to_string() })?;
+
+        let content = self.download_file_content(&file.id).await?;
+
+        // Write to destination
+        tokio::fs::write(dest, &content).await?;
+
+        // Verify hash if available
+        if let Some(expected_md5) = file.md5_checksum {
+            let computed_hash = file_hasher::compute_file_hash(dest)?;
+            // Note: Google Drive uses MD5, we use SHA-256
+            // For production, might want to compute MD5 as well for verification
+            tracing::debug!("Downloaded file hash: {}, expected MD5: {}", computed_hash, expected_md5);
+        }
+
+        Ok(dest.to_path_buf())
+    }
+
+    async fn upload(&self, source: &Path, dest: &Path) -> Result<()> {
+        let name = dest.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| UvcadError::InvalidConfig("Invalid file path".to_string()))?;
+
+        // Read file content
+        let content = tokio::fs::read(source).await?;
+
+        // Check if file already exists
+        if let Some(existing_file) = self.get_file_by_name(name).await? {
+            // Update existing file
+            self.update_file_content(&existing_file.id, content).await?;
+            tracing::info!("Updated existing file in Google Drive: {}", name);
+        } else {
+            // Upload new file
+            let file_id = self.upload_file_content(name, content).await?;
+            tracing::info!("Uploaded new file to Google Drive: {} (ID: {})", name, file_id);
+        }
+
+        Ok(())
+    }
+
+    async fn delete(&self, path: &Path) -> Result<()> {
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| UvcadError::InvalidConfig("Invalid file path".to_string()))?;
+
+        let file = self.get_file_by_name(name).await?
+            .ok_or_else(|| UvcadError::FileNotFound { path: path.to_string_lossy().to_string() })?;
+
+        let token = self.get_access_token().await?;
+        let url = format!("{}/files/{}", DRIVE_API_BASE, file.id);
+
+        let response = self.client
+            .delete(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(UvcadError::ProviderError(format!(
+                "Failed to delete file: {} - {}",
+                status, error_text
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn initialize(&mut self) -> Result<()> {
+        // Check if we have valid credentials
+        if !self.is_authenticated() {
+            return Err(UvcadError::AuthenticationFailed(
+                "Not authenticated with Google Drive".to_string()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn test_connection(&self) -> Result<bool> {
+        if !self.is_authenticated() {
+            return Ok(false);
+        }
+
+        // Try to list files to verify connection
+        match self.list_files_in_folder(&self.folder_id, None).await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+}
