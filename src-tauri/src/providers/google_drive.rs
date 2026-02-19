@@ -86,49 +86,51 @@ impl GoogleDriveProvider {
 
     /// Recursively list all files under a folder, including subfolders.
     /// `prefix` is the relative path prefix for files in this folder.
-    async fn list_files_recursive(&self, folder_id: &str, prefix: &Path) -> Result<Vec<FileMetadata>> {
-        let mut all_files = Vec::new();
-        let mut page_token: Option<String> = None;
+    fn list_files_recursive<'a>(&'a self, folder_id: &'a str, prefix: &'a Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<FileMetadata>>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut all_files = Vec::new();
+            let mut page_token: Option<String> = None;
 
-        loop {
-            let file_list = self.list_files_in_folder(folder_id, page_token).await?;
+            loop {
+                let file_list = self.list_files_in_folder(folder_id, page_token).await?;
 
-            for file in file_list.files {
-                if file.mime_type == "application/vnd.google-apps.folder" {
-                    // Recurse into subfolder
-                    let sub_prefix = prefix.join(&file.name);
-                    match self.list_files_recursive(&file.id, &sub_prefix).await {
-                        Ok(sub_files) => all_files.extend(sub_files),
-                        Err(e) => {
-                            tracing::warn!("Failed to list subfolder '{}': {}", file.name, e);
+                for file in file_list.files {
+                    if file.mime_type == "application/vnd.google-apps.folder" {
+                        // Recurse into subfolder
+                        let sub_prefix = prefix.join(&file.name);
+                        match self.list_files_recursive(&file.id, &sub_prefix).await {
+                            Ok(sub_files) => all_files.extend(sub_files),
+                            Err(e) => {
+                                tracing::warn!("Failed to list subfolder '{}': {}", file.name, e);
+                            }
                         }
+                    } else {
+                        let size = file.size
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+
+                        let modified: DateTime<Utc> = file.modified_time.parse()
+                            .unwrap_or_else(|_| Utc::now());
+
+                        all_files.push(FileMetadata {
+                            path: prefix.join(&file.name),
+                            size,
+                            modified,
+                            hash: file.md5_checksum,
+                            exists: true,
+                        });
                     }
-                } else {
-                    let size = file.size
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-
-                    let modified: DateTime<Utc> = file.modified_time.parse()
-                        .unwrap_or_else(|_| Utc::now());
-
-                    all_files.push(FileMetadata {
-                        path: prefix.join(&file.name),
-                        size,
-                        modified,
-                        hash: file.md5_checksum,
-                        exists: true,
-                    });
                 }
+
+                if file_list.next_page_token.is_none() {
+                    break;
+                }
+
+                page_token = file_list.next_page_token;
             }
 
-            if file_list.next_page_token.is_none() {
-                break;
-            }
-
-            page_token = file_list.next_page_token;
-        }
-
-        Ok(all_files)
+            Ok(all_files)
+        })
     }
 
     /// Resolve a relative path to a DriveFile by walking the folder hierarchy.

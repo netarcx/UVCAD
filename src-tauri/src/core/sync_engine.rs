@@ -487,7 +487,7 @@ impl SyncEngine {
         }
     }
 
-    async fn execute_sync_operations(&self, path: &Path, operations: Vec<SyncOperation>) -> Result<()> {
+    async fn execute_sync_operations(&self, _path: &Path, operations: Vec<SyncOperation>) -> Result<()> {
         for operation in operations {
             match operation {
                 SyncOperation::Upload { from, to, path: file_path } => {
