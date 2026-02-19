@@ -139,14 +139,17 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           )}
 
           <div className="setting-item">
-            <label>Folder ID:</label>
+            <label>Folder ID or Link:</label>
             <input
               type="text"
               value={config.gdrive_folder_id || ""}
-              onChange={(e) =>
-                setConfig({ ...config, gdrive_folder_id: e.target.value })
-              }
-              placeholder="Google Drive folder ID"
+              onChange={(e) => {
+                const value = e.target.value;
+                // Extract folder ID from Google Drive URLs
+                const match = value.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+                setConfig({ ...config, gdrive_folder_id: match ? match[1] : value });
+              }}
+              placeholder="Paste folder link or ID"
             />
           </div>
         </section>

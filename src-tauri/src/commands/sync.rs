@@ -246,6 +246,201 @@ pub async fn start_sync(app: tauri::AppHandle) -> Result<SyncResultDto, String> 
 }
 
 #[tauri::command]
+pub async fn pull_from_gdrive(app: tauri::AppHandle) -> Result<SyncResultDto, String> {
+    tracing::info!("Pull from Google Drive command called");
+
+    // Check if already syncing
+    {
+        let mut state = SYNC_STATE.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
+        if state.is_syncing {
+            return Err("Sync already in progress".to_string());
+        }
+        state.is_syncing = true;
+    }
+
+    let result = pull_from_gdrive_inner(&app).await;
+
+    // Always clear syncing flag
+    SYNC_STATE.lock().unwrap().is_syncing = false;
+
+    match result {
+        Ok(dto) => {
+            let mut state = SYNC_STATE.lock().unwrap();
+            state.last_sync = Some(chrono::Utc::now().to_rfc3339());
+            Ok(dto)
+        }
+        Err(e) => Err(e)
+    }
+}
+
+async fn pull_from_gdrive_inner(app: &tauri::AppHandle) -> Result<SyncResultDto, String> {
+    // Emit initial progress
+    let _ = app.emit_all("sync-progress", SyncProgress {
+        current_file: "Connecting to Google Drive...".to_string(),
+        total_files: 0,
+        processed_files: 0,
+        operation: "initializing".to_string(),
+        percentage: 0.0,
+    });
+
+    let (profile, db_arc) = get_or_create_default_profile().await?;
+
+    // Validate local path
+    if profile.local_path.is_empty() {
+        return Err("Local path not configured".to_string());
+    }
+
+    let local_path = PathBuf::from(&profile.local_path);
+    if !local_path.exists() {
+        tokio::fs::create_dir_all(&local_path).await
+            .map_err(|e| format!("Failed to create local directory: {}", e))?;
+    }
+
+    // Validate Google Drive config
+    let folder_id = profile.gdrive_folder_id.as_ref()
+        .ok_or_else(|| "Google Drive folder not configured".to_string())?;
+
+    let gdrive = GoogleDriveProvider::new(folder_id.clone())
+        .map_err(|e| format!("Failed to initialize Google Drive: {}", e))?;
+
+    if !gdrive.is_authenticated() {
+        return Err("Not authenticated with Google Drive. Please sign in first.".to_string());
+    }
+
+    // List all files on Google Drive
+    let _ = app.emit_all("sync-progress", SyncProgress {
+        current_file: "Listing files on Google Drive...".to_string(),
+        total_files: 0,
+        processed_files: 0,
+        operation: "scanning".to_string(),
+        percentage: 5.0,
+    });
+
+    let files = gdrive.list_files(std::path::Path::new(""))
+        .await
+        .map_err(|e| format!("Failed to list Google Drive files: {}", e))?;
+
+    let total = files.len();
+    if total == 0 {
+        let _ = app.emit_all("sync-progress", SyncProgress {
+            current_file: "No files found on Google Drive".to_string(),
+            total_files: 0,
+            processed_files: 0,
+            operation: "completed".to_string(),
+            percentage: 100.0,
+        });
+
+        return Ok(SyncResultDto {
+            actions_performed: 0,
+            files_synced: 0,
+            conflicts: vec![],
+            errors: vec![],
+        });
+    }
+
+    tracing::info!("Found {} files on Google Drive, downloading...", total);
+
+    let mut downloaded = 0;
+    let mut errors = Vec::new();
+
+    for (i, file_meta) in files.iter().enumerate() {
+        let filename = file_meta.path.to_string_lossy().to_string();
+
+        let percentage = 10.0 + (i as f32 / total as f32) * 85.0; // 10-95% range
+        let _ = app.emit_all("sync-progress", SyncProgress {
+            current_file: filename.clone(),
+            total_files: total,
+            processed_files: i,
+            operation: "downloading".to_string(),
+            percentage,
+        });
+
+        let dest_path = local_path.join(&file_meta.path);
+
+        // Create parent directories if needed
+        if let Some(parent) = dest_path.parent() {
+            if !parent.exists() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    tracing::warn!("Failed to create directory {}: {}", parent.display(), e);
+                    errors.push(format!("{}: {}", filename, e));
+                    continue;
+                }
+            }
+        }
+
+        // Download file
+        match gdrive.download(&file_meta.path, &dest_path).await {
+            Ok(_) => {
+                downloaded += 1;
+                tracing::info!("Downloaded: {}", filename);
+
+                // Update DB state for both locations
+                let profile_id = profile.id.unwrap();
+                let now = chrono::Utc::now();
+
+                // Compute local hash after download
+                let local_hash = crate::core::file_hasher::compute_file_hash(&dest_path).ok();
+
+                let db_guard = db_arc.lock().map_err(|e: std::sync::PoisonError<_>| e.to_string())?;
+                let conn = db_guard.get_connection();
+
+                // Record local file state
+                let local_state = crate::models::file_state::FileState {
+                    id: None,
+                    profile_id,
+                    file_path: filename.clone(),
+                    location: crate::models::file_state::FileLocation::Local,
+                    content_hash: local_hash,
+                    size_bytes: Some(file_meta.size as i64),
+                    modified_at: Some(now),
+                    synced_at: Some(now),
+                    status: crate::models::file_state::SyncStatus::Synced,
+                    metadata: None,
+                };
+                let _ = DbOperations::upsert_file_state(conn, &local_state);
+
+                // Record Google Drive file state
+                let gdrive_state = crate::models::file_state::FileState {
+                    id: None,
+                    profile_id,
+                    file_path: filename.clone(),
+                    location: crate::models::file_state::FileLocation::GoogleDrive,
+                    content_hash: file_meta.hash.clone(),
+                    size_bytes: Some(file_meta.size as i64),
+                    modified_at: Some(file_meta.modified),
+                    synced_at: Some(now),
+                    status: crate::models::file_state::SyncStatus::Synced,
+                    metadata: None,
+                };
+                let _ = DbOperations::upsert_file_state(conn, &gdrive_state);
+            }
+            Err(e) => {
+                tracing::error!("Failed to download {}: {}", filename, e);
+                errors.push(format!("{}: {}", filename, e));
+            }
+        }
+    }
+
+    // Emit completion
+    let _ = app.emit_all("sync-progress", SyncProgress {
+        current_file: format!("Pull complete! Downloaded {} files", downloaded),
+        total_files: total,
+        processed_files: total,
+        operation: "completed".to_string(),
+        percentage: 100.0,
+    });
+
+    tracing::info!("Pull from Google Drive complete: {}/{} files downloaded", downloaded, total);
+
+    Ok(SyncResultDto {
+        actions_performed: downloaded,
+        files_synced: downloaded,
+        conflicts: vec![],
+        errors,
+    })
+}
+
+#[tauri::command]
 pub async fn get_sync_status() -> Result<SyncStatus, String> {
     tracing::info!("Get sync status command called");
 

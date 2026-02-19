@@ -22,6 +22,7 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             commands::sync::start_sync,
+            commands::sync::pull_from_gdrive,
             commands::sync::get_sync_status,
             commands::sync::get_file_list,
             commands::sync::resolve_conflict,

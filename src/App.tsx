@@ -59,6 +59,21 @@ function App() {
     }
   };
 
+  const handlePull = async () => {
+    setIsSyncing(true);
+    try {
+      await invoke("pull_from_gdrive");
+      await loadSyncStatus();
+      await loadFiles();
+    } catch (error) {
+      console.error("Pull failed:", error);
+      const errorMessage = typeof error === 'string' ? error : String(error);
+      alert(`Pull failed: ${errorMessage}`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   const handleSync = async () => {
     setIsSyncing(true);
     try {
@@ -146,7 +161,16 @@ function App() {
               </div>
             )}
 
-            <SyncButton onSync={handleSync} isSyncing={isSyncing} />
+            <div className="action-buttons">
+              <button
+                onClick={handlePull}
+                disabled={isSyncing}
+                className="pull-btn"
+              >
+                {isSyncing ? "Working..." : "Pull from Drive"}
+              </button>
+              <SyncButton onSync={handleSync} isSyncing={isSyncing} />
+            </div>
 
             <FileList files={files} />
           </>
