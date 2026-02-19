@@ -90,7 +90,7 @@ jobs:
           path: ./artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/windows-msi/*.msi
@@ -102,11 +102,11 @@ jobs:
             ### Downloads
 
             **Windows:**
-            - `UVCAD_0.1.0_x64_en-US.msi` - Windows Installer (recommended)
-            - `UVCAD_0.1.0_x64-setup.exe` - Alternative NSIS installer
+            - `.msi` - Windows Installer (recommended)
+            - `.exe` - Alternative NSIS installer
 
             **macOS:**
-            - `UVCAD_0.1.0_aarch64.dmg` - macOS Installer (Apple Silicon)
+            - `.dmg` - macOS Installer (Apple Silicon)
 
             ### Installation Instructions
 
