@@ -1,8 +1,12 @@
 use crate::utils::error::{Result, UvcadError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+/// Timeout for waiting for the OAuth callback (5 minutes).
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct OAuthCallback {
@@ -30,53 +34,65 @@ impl OAuthCallbackServer {
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(Mutex::new(Some(tx)));
 
-        // Accept one connection
-        if let Ok((mut socket, _)) = listener.accept().await {
-            let (reader, mut writer) = socket.split();
-            let mut reader = BufReader::new(reader);
-            let mut request_line = String::new();
+        // Accept one connection with a timeout
+        let accept_result = tokio::time::timeout(CALLBACK_TIMEOUT, listener.accept()).await;
 
-            // Read the first line of the HTTP request
-            if reader.read_line(&mut request_line).await.is_ok() {
-                tracing::info!("Received OAuth callback request: {}", request_line.trim());
+        let (mut socket, _) = match accept_result {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                return Err(UvcadError::OAuthError(format!("Failed to accept connection: {}", e)));
+            }
+            Err(_) => {
+                return Err(UvcadError::OAuthError(
+                    "OAuth callback timed out after 5 minutes. Please try authenticating again.".to_string()
+                ));
+            }
+        };
 
-                // Parse the request line (e.g., "GET /oauth/callback?code=...&state=... HTTP/1.1")
-                if let Some(callback) = Self::parse_callback(&request_line) {
-                    // Send success response
-                    let response = "HTTP/1.1 200 OK\r\n\
-                                   Content-Type: text/html\r\n\
-                                   Connection: close\r\n\
-                                   \r\n\
-                                   <html><body>\
-                                   <h1>Authentication Successful!</h1>\
-                                   <p>You can close this window and return to UVCAD.</p>\
-                                   <script>window.close();</script>\
-                                   </body></html>";
+        let (reader, mut writer) = socket.split();
+        let mut reader = BufReader::new(reader);
+        let mut request_line = String::new();
 
-                    let _ = writer.write_all(response.as_bytes()).await;
+        // Read the first line of the HTTP request
+        if reader.read_line(&mut request_line).await.is_ok() {
+            tracing::info!("Received OAuth callback request: {}", request_line.trim());
 
-                    // Send the callback data
-                    if let Some(tx) = tx.lock().unwrap().take() {
-                        let _ = tx.send(callback);
-                    }
-                } else {
-                    // Send error response
-                    let response = "HTTP/1.1 400 Bad Request\r\n\
-                                   Content-Type: text/html\r\n\
-                                   Connection: close\r\n\
-                                   \r\n\
-                                   <html><body>\
-                                   <h1>Authentication Failed</h1>\
-                                   <p>Invalid callback parameters.</p>\
-                                   </body></html>";
+            // Parse the request line (e.g., "GET /oauth/callback?code=...&state=... HTTP/1.1")
+            if let Some(callback) = Self::parse_callback(&request_line) {
+                // Send success response
+                let response = "HTTP/1.1 200 OK\r\n\
+                               Content-Type: text/html\r\n\
+                               Connection: close\r\n\
+                               \r\n\
+                               <html><body>\
+                               <h1>Authentication Successful!</h1>\
+                               <p>You can close this window and return to UVCAD.</p>\
+                               <script>window.close();</script>\
+                               </body></html>";
 
-                    let _ = writer.write_all(response.as_bytes()).await;
+                let _ = writer.write_all(response.as_bytes()).await;
+
+                // Send the callback data
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(callback);
                 }
+            } else {
+                // Send error response
+                let response = "HTTP/1.1 400 Bad Request\r\n\
+                               Content-Type: text/html\r\n\
+                               Connection: close\r\n\
+                               \r\n\
+                               <html><body>\
+                               <h1>Authentication Failed</h1>\
+                               <p>Invalid callback parameters.</p>\
+                               </body></html>";
+
+                let _ = writer.write_all(response.as_bytes()).await;
             }
         }
 
         // Wait for the callback data
-        rx.await.map_err(|_| UvcadError::OAuthError("OAuth callback timeout".to_string()))
+        rx.await.map_err(|_| UvcadError::OAuthError("Failed to receive OAuth callback data".to_string()))
     }
 
     fn parse_callback(request_line: &str) -> Option<OAuthCallback> {
@@ -93,17 +109,48 @@ impl OAuthCallbackServer {
 
         // Extract query parameters
         let query = path.split('?').nth(1)?;
-        let params: std::collections::HashMap<&str, &str> = query
+        let params: std::collections::HashMap<String, String> = query
             .split('&')
             .filter_map(|pair| {
-                let mut split = pair.split('=');
-                Some((split.next()?, split.next()?))
+                let mut split = pair.splitn(2, '=');
+                let key = split.next()?;
+                let value = split.next().unwrap_or("");
+                Some((
+                    Self::url_decode(key),
+                    Self::url_decode(value),
+                ))
             })
             .collect();
 
-        let code = params.get("code")?.to_string();
-        let state = params.get("state")?.to_string();
+        let code = params.get("code")?.clone();
+        let state = params.get("state")?.clone();
+
+        if code.is_empty() || state.is_empty() {
+            return None;
+        }
 
         Some(OAuthCallback { code, state })
+    }
+
+    /// Decode a URL-encoded string (percent-encoding).
+    fn url_decode(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.bytes();
+        while let Some(b) = chars.next() {
+            match b {
+                b'%' => {
+                    let hi = chars.next().and_then(|c| (c as char).to_digit(16));
+                    let lo = chars.next().and_then(|c| (c as char).to_digit(16));
+                    if let (Some(h), Some(l)) = (hi, lo) {
+                        result.push((h * 16 + l) as u8 as char);
+                    } else {
+                        result.push('%'); // Malformed encoding, pass through
+                    }
+                }
+                b'+' => result.push(' '),
+                _ => result.push(b as char),
+            }
+        }
+        result
     }
 }

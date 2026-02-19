@@ -18,25 +18,17 @@
         "open": true
       },
       "dialog": {
-        "all": true,
-        "ask": true,
-        "confirm": true,
-        "message": true,
+        "all": false,
         "open": true,
-        "save": true
+        "message": true,
+        "confirm": true
       },
       "fs": {
-        "all": true,
+        "all": false,
         "readFile": true,
-        "writeFile": true,
         "readDir": true,
-        "copyFile": true,
-        "createDir": true,
-        "removeDir": true,
-        "removeFile": true,
-        "renameFile": true,
         "exists": true,
-        "scope": ["$APPDATA/*", "$HOME/*"]
+        "scope": ["$APPDATA/**", "$DOCUMENT/**", "$DESKTOP/**"]
       },
       "path": {
         "all": true
@@ -77,7 +69,7 @@
       }
     },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://accounts.google.com https://oauth2.googleapis.com https://www.googleapis.com; img-src 'self' data:"
     },
     "windows": [
       {

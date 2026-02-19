@@ -11,12 +11,12 @@ tauri-build = { version = "1.5", features = [] }
 
 [dependencies]
 # Tauri framework
-tauri = { version = "1.5", features = ["shell-open", "dialog-all", "fs-all", "path-all"] }
+tauri = { version = "1.5", features = ["shell-open", "dialog-confirm", "dialog-message", "dialog-open", "fs-exists", "fs-read-dir", "fs-read-file", "path-all"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["sync", "fs", "net", "io-util", "time", "macros"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -31,6 +31,7 @@ rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
 
 # Hashing and crypto
 sha2 = "0.10"
+md5 = "0.7"
 hex = "0.4"
 ring = "0.17"
 

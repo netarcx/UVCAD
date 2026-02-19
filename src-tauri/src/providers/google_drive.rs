@@ -81,16 +81,23 @@ impl GoogleDriveProvider {
         self.token_manager.store_tokens(&tokens)
     }
 
+    /// Escape a string for use in a Google Drive API query parameter.
+    /// Single quotes must be escaped with a backslash.
+    fn escape_drive_query(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('\'', "\\'")
+    }
+
     async fn list_files_in_folder(&self, folder_id: &str, page_token: Option<String>) -> Result<FileList> {
         let token = self.get_access_token().await?;
 
+        let safe_folder_id = Self::escape_drive_query(folder_id);
         let mut url = format!(
             "{}/files?q='{}'+in+parents+and+trashed=false&fields=files(id,name,mimeType,size,modifiedTime,md5Checksum),nextPageToken",
-            DRIVE_API_BASE, folder_id
+            DRIVE_API_BASE, safe_folder_id
         );
 
-        if let Some(token) = page_token {
-            url.push_str(&format!("&pageToken={}", token));
+        if let Some(pt) = page_token {
+            url.push_str(&format!("&pageToken={}", pt));
         }
 
         let response = self.client
@@ -118,9 +125,11 @@ impl GoogleDriveProvider {
     async fn get_file_by_name(&self, name: &str) -> Result<Option<DriveFile>> {
         let token = self.get_access_token().await?;
 
+        let safe_folder_id = Self::escape_drive_query(&self.folder_id);
+        let safe_name = Self::escape_drive_query(name);
         let url = format!(
             "{}/files?q='{}'+in+parents+and+name='{}'+and+trashed=false&fields=files(id,name,mimeType,size,modifiedTime,md5Checksum)",
-            DRIVE_API_BASE, self.folder_id, name
+            DRIVE_API_BASE, safe_folder_id, safe_name
         );
 
         let response = self.client
@@ -330,12 +339,16 @@ impl StorageProvider for GoogleDriveProvider {
         // Write to destination
         tokio::fs::write(dest, &content).await?;
 
-        // Verify hash if available
+        // Verify hash using MD5 (Google Drive's native hash algorithm)
         if let Some(expected_md5) = file.md5_checksum {
-            let computed_hash = file_hasher::compute_file_hash(dest)?;
-            // Note: Google Drive uses MD5, we use SHA-256
-            // For production, might want to compute MD5 as well for verification
-            tracing::debug!("Downloaded file hash: {}, expected MD5: {}", computed_hash, expected_md5);
+            let computed_md5 = file_hasher::compute_file_md5(dest)?;
+            if !computed_md5.eq_ignore_ascii_case(&expected_md5) {
+                return Err(UvcadError::SyncFailed(format!(
+                    "Download integrity check failed for '{}': expected MD5 {}, got {}",
+                    name, expected_md5, computed_md5
+                )));
+            }
+            tracing::debug!("Download integrity verified for '{}' (MD5: {})", name, computed_md5);
         }
 
         Ok(dest.to_path_buf())

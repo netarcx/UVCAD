@@ -26,6 +26,10 @@ pub async fn start_google_auth(client_id: String, client_secret: String) -> Resu
     // Generate auth URL
     let auth_url = manager.start_auth_flow().await.map_err(|e| e.to_string())?;
 
+    // Store manager BEFORE opening browser to avoid race condition
+    // where the callback arrives before the manager is stored
+    *AUTH_MANAGER.lock().await = Some(manager);
+
     // Open browser to auth URL
     if let Err(e) = open::that(&auth_url) {
         tracing::warn!("Failed to open browser: {}", e);
@@ -34,9 +38,6 @@ pub async fn start_google_auth(client_id: String, client_secret: String) -> Resu
 
     tracing::info!("Browser opened, waiting for callback...");
 
-    // Store manager for callback completion
-    *AUTH_MANAGER.lock().await = Some(manager);
-
     Ok("Authentication started. Please complete the process in your browser.".to_string())
 }
 
@@ -44,16 +45,27 @@ pub async fn start_google_auth(client_id: String, client_secret: String) -> Resu
 pub async fn complete_google_auth() -> Result<String, String> {
     tracing::info!("Completing Google OAuth flow...");
 
-    let manager_lock = AUTH_MANAGER.lock().await;
-    let manager = manager_lock.as_ref()
-        .ok_or_else(|| "OAuth flow not started".to_string())?;
+    // Take the manager out of the lock so we don't hold it across the await.
+    // This allows other auth commands (get_auth_status, logout) to proceed.
+    let manager = {
+        let mut lock = AUTH_MANAGER.lock().await;
+        lock.take().ok_or_else(|| "OAuth flow not started".to_string())?
+    };
 
-    // Wait for callback and exchange code for tokens
-    let tokens = manager.complete_auth_flow().await.map_err(|e| e.to_string())?;
+    // Wait for callback and exchange code for tokens (no lock held)
+    let result = manager.complete_auth_flow().await.map_err(|e| e.to_string());
 
-    tracing::info!("Google authentication successful!");
-
-    Ok(format!("Successfully authenticated! Token expires at: {:?}", tokens.expires_at))
+    match result {
+        Ok(tokens) => {
+            tracing::info!("Google authentication successful!");
+            Ok(format!("Successfully authenticated! Token expires at: {:?}", tokens.expires_at))
+        }
+        Err(e) => {
+            // Auth failed — don't leave a stale manager
+            tracing::error!("Google authentication failed: {}", e);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]

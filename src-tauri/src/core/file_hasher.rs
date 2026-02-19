@@ -25,6 +25,25 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
     Ok(hex::encode(result))
 }
 
+/// Compute MD5 hash of a file (for Google Drive compatibility)
+pub fn compute_file_md5(path: &Path) -> Result<String> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut context = md5::Context::new();
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        context.consume(&buffer[..count]);
+    }
+
+    let digest = context.compute();
+    Ok(format!("{:x}", digest))
+}
+
 /// Compute SHA-256 hash of bytes
 pub fn compute_bytes_hash(data: &[u8]) -> String {
     let mut hasher = Sha256::new();

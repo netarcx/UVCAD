@@ -19,6 +19,7 @@ function App() {
   const [files, setFiles] = useState<FileInfo[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
 
   useEffect(() => {
     loadSyncStatus();
@@ -59,6 +60,7 @@ function App() {
   };
 
   const handleSync = async () => {
+    setIsSyncing(true);
     try {
       await invoke("start_sync");
       await loadSyncStatus();
@@ -71,10 +73,12 @@ function App() {
 
       // Check if it's a deletion safety error
       if (errorMessage.includes("SAFETY CHECK FAILED")) {
-        alert(`❌ Sync Aborted - Safety Check Failed\n\n${errorMessage}\n\nNo changes were made to your files.`);
+        alert(`Sync Aborted - Safety Check Failed\n\n${errorMessage}\n\nNo changes were made to your files.`);
       } else {
         alert(`Sync failed: ${errorMessage}`);
       }
+    } finally {
+      setIsSyncing(false);
     }
   };
 
@@ -100,8 +104,8 @@ function App() {
                 <>
                   <div className="status-item">
                     <span className="label">Status:</span>
-                    <span className={syncStatus.is_syncing ? "syncing" : "idle"}>
-                      {syncStatus.is_syncing ? "Syncing..." : "Idle"}
+                    <span className={isSyncing ? "syncing" : "idle"}>
+                      {isSyncing ? "Syncing..." : "Idle"}
                     </span>
                   </div>
                   <div className="status-item">
@@ -142,7 +146,7 @@ function App() {
               </div>
             )}
 
-            <SyncButton onSync={handleSync} isSyncing={syncStatus?.is_syncing || false} />
+            <SyncButton onSync={handleSync} isSyncing={isSyncing} />
 
             <FileList files={files} />
           </>

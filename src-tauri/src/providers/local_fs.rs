@@ -15,11 +15,45 @@ impl LocalFsProvider {
         Self { root_path }
     }
 
-    fn normalize_path(&self, path: &Path) -> PathBuf {
+    /// Convert a relative path to an absolute path under root_path.
+    fn to_absolute(&self, path: &Path) -> PathBuf {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.root_path.join(path)
+        }
+    }
+
+    /// Convert an absolute path to a relative path from root_path.
+    /// This ensures all providers use consistent relative path keys.
+    fn to_relative(&self, path: &Path) -> PathBuf {
+        path.strip_prefix(&self.root_path)
+            .unwrap_or(path)
+            .to_path_buf()
+    }
+
+    /// Get file metadata for an absolute path, returning a relative path in the result.
+    async fn get_file_metadata_absolute(&self, absolute_path: &Path) -> Result<Option<FileMetadata>> {
+        match fs::metadata(absolute_path).await {
+            Ok(metadata) => {
+                let modified = metadata.modified()?;
+                let modified_dt: DateTime<Utc> = modified.into();
+
+                let hash = if metadata.is_file() {
+                    Some(file_hasher::compute_file_hash(absolute_path)?)
+                } else {
+                    None
+                };
+
+                Ok(Some(FileMetadata {
+                    path: self.to_relative(absolute_path),
+                    size: metadata.len(),
+                    modified: modified_dt,
+                    hash,
+                    exists: true,
+                }))
+            }
+            Err(_) => Ok(None),
         }
     }
 }
@@ -31,20 +65,21 @@ impl StorageProvider for LocalFsProvider {
     }
 
     async fn list_files(&self, path: &Path) -> Result<Vec<FileMetadata>> {
-        let full_path = self.normalize_path(path);
+        let full_path = self.to_absolute(path);
         let mut files = Vec::new();
 
         let mut entries = fs::read_dir(&full_path).await?;
         while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
+            let entry_path = entry.path();
+            let file_type = entry.file_type().await?;
 
-            if path.is_file() {
-                if let Some(metadata) = self.get_metadata(&path).await? {
+            if file_type.is_file() {
+                if let Some(metadata) = self.get_file_metadata_absolute(&entry_path).await? {
                     files.push(metadata);
                 }
-            } else if path.is_dir() {
-                // Recursively list subdirectories
-                let subfiles = self.list_files(&path).await?;
+            } else if file_type.is_dir() {
+                // Recursively list subdirectories using the absolute path
+                let subfiles = self.list_files(&entry_path).await?;
                 files.extend(subfiles);
             }
         }
@@ -53,44 +88,23 @@ impl StorageProvider for LocalFsProvider {
     }
 
     async fn get_metadata(&self, path: &Path) -> Result<Option<FileMetadata>> {
-        let full_path = self.normalize_path(path);
-
-        match fs::metadata(&full_path).await {
-            Ok(metadata) => {
-                let modified = metadata.modified()?;
-                let modified_dt: DateTime<Utc> = modified.into();
-
-                let hash = if metadata.is_file() {
-                    Some(file_hasher::compute_file_hash(&full_path)?)
-                } else {
-                    None
-                };
-
-                Ok(Some(FileMetadata {
-                    path: full_path,
-                    size: metadata.len(),
-                    modified: modified_dt,
-                    hash,
-                    exists: true,
-                }))
-            }
-            Err(_) => Ok(None),
-        }
+        let full_path = self.to_absolute(path);
+        self.get_file_metadata_absolute(&full_path).await
     }
 
     async fn exists(&self, path: &Path) -> Result<bool> {
-        let full_path = self.normalize_path(path);
+        let full_path = self.to_absolute(path);
         Ok(full_path.exists())
     }
 
     async fn download(&self, path: &Path, dest: &Path) -> Result<PathBuf> {
-        let full_path = self.normalize_path(path);
+        let full_path = self.to_absolute(path);
         fs::copy(&full_path, dest).await?;
         Ok(dest.to_path_buf())
     }
 
     async fn upload(&self, source: &Path, dest: &Path) -> Result<()> {
-        let full_dest = self.normalize_path(dest);
+        let full_dest = self.to_absolute(dest);
 
         // Ensure parent directory exists
         if let Some(parent) = full_dest.parent() {
@@ -102,7 +116,7 @@ impl StorageProvider for LocalFsProvider {
     }
 
     async fn delete(&self, path: &Path) -> Result<()> {
-        let full_path = self.normalize_path(path);
+        let full_path = self.to_absolute(path);
         fs::remove_file(&full_path).await?;
         Ok(())
     }

@@ -237,12 +237,33 @@ impl SyncEngine {
         // Conflict: Multiple locations changed
         let change_count = [local_changed, gdrive_changed, smb_changed].iter().filter(|&&c| c).count();
         if change_count > 1 {
-            // Check if changes are identical (same hash)
-            if let (Some(l), Some(g)) = (local, gdrive) {
-                if local_changed && gdrive_changed && l.hash == g.hash {
-                    // Same content, not a conflict
-                    return self.sync_to_missing(path, local, gdrive, smb);
-                }
+            // Check if changes are identical by comparing all changed locations' hashes.
+            // Note: Cross-provider hash comparison (e.g. SHA-256 vs MD5) will never match,
+            // so we compare modification times as a fallback heuristic for cross-provider
+            // "same content" detection. If only one hash algorithm is used across all
+            // providers, hash comparison works directly.
+            let changed_snapshots: Vec<&FileSnapshot> = [
+                local.filter(|_| local_changed),
+                gdrive.filter(|_| gdrive_changed),
+                smb.filter(|_| smb_changed),
+            ].into_iter().flatten().collect();
+
+            let all_same = if changed_snapshots.len() >= 2 {
+                let first = &changed_snapshots[0];
+                changed_snapshots[1..].iter().all(|s| {
+                    // Compare hashes if both are Some and non-empty
+                    match (&first.hash, &s.hash) {
+                        (Some(h1), Some(h2)) if h1.len() == h2.len() => h1 == h2,
+                        _ => false, // Different hash algorithms or missing hashes — treat as conflict
+                    }
+                })
+            } else {
+                false
+            };
+
+            if all_same {
+                // Same content across all changed locations, not a conflict
+                return self.sync_to_missing(path, local, gdrive, smb);
             }
 
             return SyncAction::Conflict(ConflictInfo {
@@ -286,20 +307,28 @@ impl SyncEngine {
         }
     }
 
+    /// Check if the destination is missing or has a different hash than the source.
+    fn needs_update(source: &FileSnapshot, dest: Option<&FileSnapshot>) -> bool {
+        match dest {
+            None => true, // destination missing
+            Some(d) => source.hash != d.hash, // destination exists but hash differs
+        }
+    }
+
     fn sync_from_local(&self, path: &Path, local: Option<&FileSnapshot>,
                       gdrive: Option<&FileSnapshot>, smb: Option<&FileSnapshot>) -> SyncAction {
         let mut operations = Vec::new();
 
         if let Some(local_file) = local {
-            // Local file exists - sync to other locations
-            if self.gdrive_provider.is_some() && gdrive.is_none() {
+            // Local file exists - sync to other locations (missing OR stale)
+            if self.gdrive_provider.is_some() && Self::needs_update(local_file, gdrive) {
                 operations.push(SyncOperation::Upload {
                     from: FileLocation::Local,
                     to: FileLocation::GoogleDrive,
                     path: path.to_path_buf(),
                 });
             }
-            if self.smb_provider.is_some() && smb.is_none() {
+            if self.smb_provider.is_some() && Self::needs_update(local_file, smb) {
                 operations.push(SyncOperation::Upload {
                     from: FileLocation::Local,
                     to: FileLocation::Smb,
@@ -333,16 +362,16 @@ impl SyncEngine {
                        gdrive: Option<&FileSnapshot>, smb: Option<&FileSnapshot>) -> SyncAction {
         let mut operations = Vec::new();
 
-        if let Some(_gdrive_file) = gdrive {
-            // Google Drive file exists - sync to other locations
-            if local.is_none() {
+        if let Some(gdrive_file) = gdrive {
+            // Google Drive file exists - sync to other locations (missing OR stale)
+            if Self::needs_update(gdrive_file, local) {
                 operations.push(SyncOperation::Upload {
                     from: FileLocation::GoogleDrive,
                     to: FileLocation::Local,
                     path: path.to_path_buf(),
                 });
             }
-            if self.smb_provider.is_some() && smb.is_none() {
+            if self.smb_provider.is_some() && Self::needs_update(gdrive_file, smb) {
                 operations.push(SyncOperation::Upload {
                     from: FileLocation::GoogleDrive,
                     to: FileLocation::Smb,
@@ -376,16 +405,16 @@ impl SyncEngine {
                     gdrive: Option<&FileSnapshot>, smb: Option<&FileSnapshot>) -> SyncAction {
         let mut operations = Vec::new();
 
-        if let Some(_smb_file) = smb {
-            // Samba file exists - sync to other locations
-            if local.is_none() {
+        if let Some(smb_file) = smb {
+            // Samba file exists - sync to other locations (missing OR stale)
+            if Self::needs_update(smb_file, local) {
                 operations.push(SyncOperation::Upload {
                     from: FileLocation::Smb,
                     to: FileLocation::Local,
                     path: path.to_path_buf(),
                 });
             }
-            if self.gdrive_provider.is_some() && gdrive.is_none() {
+            if self.gdrive_provider.is_some() && Self::needs_update(smb_file, gdrive) {
                 operations.push(SyncOperation::Upload {
                     from: FileLocation::Smb,
                     to: FileLocation::GoogleDrive,
@@ -562,6 +591,13 @@ impl SyncEngine {
             return Ok(());
         }
 
+        if total_files == 0 {
+            return Err(UvcadError::SyncFailed(
+                "SAFETY CHECK FAILED: Deletions planned but no files found. \
+                Please verify your sync folders are accessible and try again.".to_string()
+            ));
+        }
+
         let deletion_percentage = (deletion_count as f32 / total_files as f32) * 100.0;
 
         tracing::info!(
@@ -640,6 +676,24 @@ impl SyncEngine {
         let conn = db_guard.get_connection();
 
         let now = chrono::Utc::now();
+
+        // Get existing file states to detect deletions
+        let existing_states = DbOperations::get_file_states(conn, self.profile_id)?;
+
+        // Remove DB records for files that no longer exist at their location
+        for state in &existing_states {
+            let path = PathBuf::from(&state.file_path);
+            let still_exists = match state.location {
+                FileLocation::Local => local_files.contains_key(&path),
+                FileLocation::GoogleDrive => gdrive_files.contains_key(&path),
+                FileLocation::Smb => smb_files.contains_key(&path),
+            };
+            if !still_exists {
+                DbOperations::delete_file_state(
+                    conn, self.profile_id, &state.file_path, state.location.as_str()
+                )?;
+            }
+        }
 
         // Save local file states
         for (path, snapshot) in local_files {

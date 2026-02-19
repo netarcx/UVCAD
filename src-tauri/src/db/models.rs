@@ -102,6 +102,15 @@ impl DbOperations {
         Ok(states)
     }
 
+    /// Delete file state records for a specific profile, file_path, and location.
+    pub fn delete_file_state(conn: &Connection, profile_id: i64, file_path: &str, location: &str) -> Result<()> {
+        conn.execute(
+            "DELETE FROM file_states WHERE profile_id = ?1 AND file_path = ?2 AND location = ?3",
+            rusqlite::params![profile_id, file_path, location],
+        )?;
+        Ok(())
+    }
+
     // Conflict operations
     pub fn create_conflict(conn: &Connection, conflict: &Conflict) -> Result<i64> {
         conn.execute(
