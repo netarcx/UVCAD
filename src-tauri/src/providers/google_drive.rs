@@ -84,6 +84,169 @@ impl GoogleDriveProvider {
         s.replace('\\', "\\\\").replace('\'', "\\'")
     }
 
+    /// Recursively list all files under a folder, including subfolders.
+    /// `prefix` is the relative path prefix for files in this folder.
+    async fn list_files_recursive(&self, folder_id: &str, prefix: &Path) -> Result<Vec<FileMetadata>> {
+        let mut all_files = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let file_list = self.list_files_in_folder(folder_id, page_token).await?;
+
+            for file in file_list.files {
+                if file.mime_type == "application/vnd.google-apps.folder" {
+                    // Recurse into subfolder
+                    let sub_prefix = prefix.join(&file.name);
+                    match self.list_files_recursive(&file.id, &sub_prefix).await {
+                        Ok(sub_files) => all_files.extend(sub_files),
+                        Err(e) => {
+                            tracing::warn!("Failed to list subfolder '{}': {}", file.name, e);
+                        }
+                    }
+                } else {
+                    let size = file.size
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0);
+
+                    let modified: DateTime<Utc> = file.modified_time.parse()
+                        .unwrap_or_else(|_| Utc::now());
+
+                    all_files.push(FileMetadata {
+                        path: prefix.join(&file.name),
+                        size,
+                        modified,
+                        hash: file.md5_checksum,
+                        exists: true,
+                    });
+                }
+            }
+
+            if file_list.next_page_token.is_none() {
+                break;
+            }
+
+            page_token = file_list.next_page_token;
+        }
+
+        Ok(all_files)
+    }
+
+    /// Resolve a relative path to a DriveFile by walking the folder hierarchy.
+    /// e.g. "subfolder/file.dwg" → find "subfolder" folder in root, then find "file.dwg" in it.
+    async fn resolve_path(&self, path: &Path) -> Result<Option<DriveFile>> {
+        let components: Vec<&str> = path.iter()
+            .filter_map(|c| c.to_str())
+            .collect();
+
+        if components.is_empty() {
+            return Ok(None);
+        }
+
+        let mut current_folder_id = self.folder_id.clone();
+
+        // Walk through directory components (all except last)
+        for &dir_name in &components[..components.len() - 1] {
+            match self.get_item_by_name_in_folder(&current_folder_id, dir_name).await? {
+                Some(folder) if folder.mime_type == "application/vnd.google-apps.folder" => {
+                    current_folder_id = folder.id;
+                }
+                _ => return Ok(None), // Subfolder not found
+            }
+        }
+
+        // Find the final file/folder in the resolved parent
+        let file_name = components.last().unwrap();
+        self.get_item_by_name_in_folder(&current_folder_id, file_name).await
+    }
+
+    /// Find a file or folder by name within a specific parent folder.
+    async fn get_item_by_name_in_folder(&self, folder_id: &str, name: &str) -> Result<Option<DriveFile>> {
+        let token = self.get_access_token().await?;
+
+        let safe_folder_id = Self::escape_drive_query(folder_id);
+        let safe_name = Self::escape_drive_query(name);
+        let url = format!(
+            "{}/files?q='{}'+in+parents+and+name='{}'+and+trashed=false&fields=files(id,name,mimeType,size,modifiedTime,md5Checksum)",
+            DRIVE_API_BASE, safe_folder_id, safe_name
+        );
+
+        let response = self.client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let file_list: FileList = response.json().await
+            .map_err(|e| UvcadError::ProviderError(format!("Failed to parse response: {}", e)))?;
+
+        Ok(file_list.files.into_iter().next())
+    }
+
+    /// Find the folder ID for a parent path, creating folders as needed for uploads.
+    async fn resolve_or_create_parent_folder(&self, path: &Path) -> Result<String> {
+        let components: Vec<&str> = path.iter()
+            .filter_map(|c| c.to_str())
+            .collect();
+
+        let mut current_folder_id = self.folder_id.clone();
+
+        // Walk/create each directory component (all except last, which is the filename)
+        for &dir_name in &components[..components.len().saturating_sub(1)] {
+            match self.get_item_by_name_in_folder(&current_folder_id, dir_name).await? {
+                Some(folder) if folder.mime_type == "application/vnd.google-apps.folder" => {
+                    current_folder_id = folder.id;
+                }
+                _ => {
+                    // Create the subfolder
+                    current_folder_id = self.create_folder(dir_name, &current_folder_id).await?;
+                }
+            }
+        }
+
+        Ok(current_folder_id)
+    }
+
+    /// Create a folder in Google Drive.
+    async fn create_folder(&self, name: &str, parent_id: &str) -> Result<String> {
+        let token = self.get_access_token().await?;
+
+        let metadata = serde_json::json!({
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id]
+        });
+
+        let url = format!("{}/files", DRIVE_API_BASE);
+
+        let response = self.client
+            .post(&url)
+            .bearer_auth(token)
+            .header("Content-Type", "application/json")
+            .body(metadata.to_string())
+            .send()
+            .await
+            .map_err(|e| UvcadError::NetworkError(e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(UvcadError::ProviderError(format!(
+                "Failed to create folder '{}': {} - {}", name, status, error_text
+            )));
+        }
+
+        let file: DriveFile = response.json().await
+            .map_err(|e| UvcadError::ProviderError(format!("Failed to parse response: {}", e)))?;
+
+        tracing::info!("Created folder '{}' (ID: {})", name, file.id);
+        Ok(file.id)
+    }
+
     async fn list_files_in_folder(&self, folder_id: &str, page_token: Option<String>) -> Result<FileList> {
         let token = self.get_access_token().await?;
 
@@ -119,33 +282,6 @@ impl GoogleDriveProvider {
         Ok(file_list)
     }
 
-    async fn get_file_by_name(&self, name: &str) -> Result<Option<DriveFile>> {
-        let token = self.get_access_token().await?;
-
-        let safe_folder_id = Self::escape_drive_query(&self.folder_id);
-        let safe_name = Self::escape_drive_query(name);
-        let url = format!(
-            "{}/files?q='{}'+in+parents+and+name='{}'+and+trashed=false&fields=files(id,name,mimeType,size,modifiedTime,md5Checksum)",
-            DRIVE_API_BASE, safe_folder_id, safe_name
-        );
-
-        let response = self.client
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| UvcadError::NetworkError(e))?;
-
-        if !response.status().is_success() {
-            return Ok(None);
-        }
-
-        let file_list: FileList = response.json().await
-            .map_err(|e| UvcadError::ProviderError(format!("Failed to parse response: {}", e)))?;
-
-        Ok(file_list.files.into_iter().next())
-    }
-
     async fn download_file_content(&self, file_id: &str) -> Result<Vec<u8>> {
         let token = self.get_access_token().await?;
 
@@ -173,13 +309,12 @@ impl GoogleDriveProvider {
         Ok(bytes.to_vec())
     }
 
-    async fn upload_file_content(&self, name: &str, content: Vec<u8>) -> Result<String> {
+    async fn upload_file_to_folder(&self, name: &str, parent_id: &str, content: Vec<u8>) -> Result<String> {
         let token = self.get_access_token().await?;
 
-        // Create metadata
         let metadata = FileMetadataUpload {
             name: name.to_string(),
-            parents: vec![self.folder_id.clone()],
+            parents: vec![parent_id.to_string()],
         };
 
         // Use multipart upload
@@ -256,50 +391,15 @@ impl StorageProvider for GoogleDriveProvider {
     }
 
     async fn list_files(&self, _path: &Path) -> Result<Vec<FileMetadata>> {
-        let mut all_files = Vec::new();
-        let mut page_token: Option<String> = None;
-
-        loop {
-            let file_list = self.list_files_in_folder(&self.folder_id, page_token).await?;
-
-            for file in file_list.files {
-                // Skip folders
-                if file.mime_type == "application/vnd.google-apps.folder" {
-                    continue;
-                }
-
-                let size = file.size
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-
-                let modified: DateTime<Utc> = file.modified_time.parse()
-                    .unwrap_or_else(|_| Utc::now());
-
-                all_files.push(FileMetadata {
-                    path: PathBuf::from(&file.name),
-                    size,
-                    modified,
-                    hash: file.md5_checksum,
-                    exists: true,
-                });
-            }
-
-            if file_list.next_page_token.is_none() {
-                break;
-            }
-
-            page_token = file_list.next_page_token;
-        }
-
-        Ok(all_files)
+        self.list_files_recursive(&self.folder_id, Path::new("")).await
     }
 
     async fn get_metadata(&self, path: &Path) -> Result<Option<FileMetadata>> {
-        let name = path.file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| UvcadError::InvalidConfig("Invalid file path".to_string()))?;
+        if let Some(file) = self.resolve_path(path).await? {
+            if file.mime_type == "application/vnd.google-apps.folder" {
+                return Ok(None);
+            }
 
-        if let Some(file) = self.get_file_by_name(name).await? {
             let size = file.size
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
@@ -324,11 +424,7 @@ impl StorageProvider for GoogleDriveProvider {
     }
 
     async fn download(&self, path: &Path, dest: &Path) -> Result<PathBuf> {
-        let name = path.file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| UvcadError::InvalidConfig("Invalid file path".to_string()))?;
-
-        let file = self.get_file_by_name(name).await?
+        let file = self.resolve_path(path).await?
             .ok_or_else(|| UvcadError::FileNotFound { path: path.to_string_lossy().to_string() })?;
 
         let content = self.download_file_content(&file.id).await?;
@@ -342,10 +438,10 @@ impl StorageProvider for GoogleDriveProvider {
             if !computed_md5.eq_ignore_ascii_case(&expected_md5) {
                 return Err(UvcadError::SyncFailed(format!(
                     "Download integrity check failed for '{}': expected MD5 {}, got {}",
-                    name, expected_md5, computed_md5
+                    path.display(), expected_md5, computed_md5
                 )));
             }
-            tracing::debug!("Download integrity verified for '{}' (MD5: {})", name, computed_md5);
+            tracing::debug!("Download integrity verified for '{}' (MD5: {})", path.display(), computed_md5);
         }
 
         Ok(dest.to_path_buf())
@@ -359,26 +455,23 @@ impl StorageProvider for GoogleDriveProvider {
         // Read file content
         let content = tokio::fs::read(source).await?;
 
-        // Check if file already exists
-        if let Some(existing_file) = self.get_file_by_name(name).await? {
+        // Check if file already exists at this path
+        if let Some(existing_file) = self.resolve_path(dest).await? {
             // Update existing file
             self.update_file_content(&existing_file.id, content).await?;
-            tracing::info!("Updated existing file in Google Drive: {}", name);
+            tracing::info!("Updated existing file in Google Drive: {}", dest.display());
         } else {
-            // Upload new file
-            let file_id = self.upload_file_content(name, content).await?;
-            tracing::info!("Uploaded new file to Google Drive: {} (ID: {})", name, file_id);
+            // Resolve or create parent folders, then upload
+            let parent_id = self.resolve_or_create_parent_folder(dest).await?;
+            let file_id = self.upload_file_to_folder(name, &parent_id, content).await?;
+            tracing::info!("Uploaded new file to Google Drive: {} (ID: {})", dest.display(), file_id);
         }
 
         Ok(())
     }
 
     async fn delete(&self, path: &Path) -> Result<()> {
-        let name = path.file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| UvcadError::InvalidConfig("Invalid file path".to_string()))?;
-
-        let file = self.get_file_by_name(name).await?
+        let file = self.resolve_path(path).await?
             .ok_or_else(|| UvcadError::FileNotFound { path: path.to_string_lossy().to_string() })?;
 
         let token = self.get_access_token().await?;
