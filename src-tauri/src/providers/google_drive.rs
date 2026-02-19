@@ -4,7 +4,6 @@ use crate::utils::error::{Result, UvcadError};
 use crate::utils::keyring::{OAuthTokens, TokenManager};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -58,15 +57,13 @@ impl GoogleDriveProvider {
     async fn get_access_token(&self) -> Result<String> {
         let tokens = self.token_manager.get_tokens()?;
 
-        // Check if token is expired
+        // Check if token is expired or expiring within 5 minutes
         if let Some(expires_at) = tokens.expires_at {
             let now = chrono::Utc::now().timestamp();
             if expires_at - now < 300 {
-                // Token expired or expiring soon - need to refresh
-                // For now, return error - in production, integrate with AuthManager
-                return Err(UvcadError::AuthenticationFailed(
-                    "Access token expired, please re-authenticate".to_string()
-                ));
+                tracing::info!("Access token expired or expiring soon, refreshing...");
+                let mut auth_manager = crate::core::auth_manager::AuthManager::new()?;
+                return auth_manager.get_valid_token().await;
             }
         }
 

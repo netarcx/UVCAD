@@ -1,39 +1,33 @@
+use crate::core::credentials;
 use crate::core::oauth_server::OAuthCallbackServer;
 use crate::utils::error::{Result, UvcadError};
-use crate::utils::keyring::{OAuthTokens, TokenManager};
+use crate::utils::keyring::{CredentialManager, OAuthCredentials, OAuthTokens, TokenManager};
 use oauth2::{
     basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
     PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
 };
 use oauth2::reqwest::async_http_client;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 pub struct AuthManager {
     token_manager: TokenManager,
+    credential_manager: CredentialManager,
     oauth_client: Option<BasicClient>,
-    pkce_verifier: Arc<Mutex<Option<String>>>,
-    csrf_token: Arc<Mutex<Option<String>>>,
 }
 
 impl AuthManager {
     pub fn new() -> Result<Self> {
         let token_manager = TokenManager::new("google_drive")?;
+        let credential_manager = CredentialManager::new("google_drive")?;
 
         Ok(Self {
             token_manager,
+            credential_manager,
             oauth_client: None,
-            pkce_verifier: Arc::new(Mutex::new(None)),
-            csrf_token: Arc::new(Mutex::new(None)),
         })
     }
 
-    pub fn initialize_oauth(
-        &mut self,
-        client_id: String,
-        client_secret: String,
-    ) -> Result<()> {
-        // Google OAuth endpoints
+    /// Build a BasicClient from client_id and client_secret.
+    fn build_oauth_client(client_id: &str, client_secret: &str) -> Result<BasicClient> {
         let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
             .map_err(|e| UvcadError::OAuthError(format!("Invalid auth URL: {}", e)))?;
 
@@ -44,69 +38,88 @@ impl AuthManager {
             .map_err(|e| UvcadError::OAuthError(format!("Invalid redirect URL: {}", e)))?;
 
         let client = BasicClient::new(
-            ClientId::new(client_id),
-            Some(ClientSecret::new(client_secret)),
+            ClientId::new(client_id.to_string()),
+            Some(ClientSecret::new(client_secret.to_string())),
             auth_url,
             Some(token_url),
         )
         .set_redirect_uri(redirect_url);
 
-        self.oauth_client = Some(client);
+        Ok(client)
+    }
+
+    /// Ensure oauth_client is initialized. Loads credentials from:
+    /// 1. Already-initialized client (no-op)
+    /// 2. Stored credentials in keyring
+    /// 3. Compile-time embedded defaults
+    fn ensure_oauth_client(&mut self) -> Result<()> {
+        if self.oauth_client.is_some() {
+            return Ok(());
+        }
+
+        let (client_id, client_secret) = if let Ok(creds) = self.credential_manager.get_credentials() {
+            (creds.client_id, creds.client_secret)
+        } else {
+            (
+                credentials::default_client_id().to_string(),
+                credentials::default_client_secret().to_string(),
+            )
+        };
+
+        self.oauth_client = Some(Self::build_oauth_client(&client_id, &client_secret)?);
         Ok(())
     }
 
-    pub async fn start_auth_flow(&self) -> Result<String> {
-        let client = self.oauth_client.as_ref()
-            .ok_or_else(|| UvcadError::OAuthError("OAuth client not initialized".to_string()))?;
+    /// Complete OAuth flow in a single call:
+    /// 1. Build OAuth client from embedded credentials
+    /// 2. Generate PKCE challenge + auth URL
+    /// 3. Start callback server BEFORE opening browser (fixes race condition)
+    /// 4. Open browser
+    /// 5. Wait for callback (5 min timeout)
+    /// 6. Verify CSRF, exchange code for tokens
+    /// 7. Store tokens + credentials in keyring
+    pub async fn authenticate(&mut self) -> Result<OAuthTokens> {
+        let client_id = credentials::default_client_id().to_string();
+        let client_secret = credentials::default_client_secret().to_string();
 
+        let client = Self::build_oauth_client(&client_id, &client_secret)?;
+
+        // Generate PKCE challenge
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
+        // Generate auth URL
         let (auth_url, csrf_token) = client
             .authorize_url(CsrfToken::new_random)
             .add_scope(Scope::new("https://www.googleapis.com/auth/drive".to_string()))
             .set_pkce_challenge(pkce_challenge)
             .url();
 
-        // Store PKCE verifier and CSRF token for later verification
-        *self.pkce_verifier.lock().await = Some(pkce_verifier.secret().clone());
-        *self.csrf_token.lock().await = Some(csrf_token.secret().clone());
-
-        Ok(auth_url.to_string())
-    }
-
-    pub async fn complete_auth_flow(&self) -> Result<OAuthTokens> {
-        // Start the callback server
+        // Start callback server BEFORE opening browser (eliminates race condition)
         let server = OAuthCallbackServer::new(8080);
 
-        tracing::info!("Waiting for OAuth callback...");
+        // Open browser
+        if let Err(e) = open::that(auth_url.as_str()) {
+            tracing::warn!("Failed to open browser: {}", e);
+            return Err(UvcadError::OAuthError(format!(
+                "Failed to open browser. Please open this URL manually:\n{}",
+                auth_url
+            )));
+        }
+
+        tracing::info!("Browser opened for OAuth, waiting for callback...");
+
+        // Wait for callback (5 min timeout is in OAuthCallbackServer)
         let callback = server.wait_for_callback().await?;
 
         // Verify CSRF token
-        let expected_csrf = self.csrf_token.lock().await.clone()
-            .ok_or_else(|| UvcadError::OAuthError("No CSRF token found".to_string()))?;
-
-        if callback.state != expected_csrf {
+        if callback.state != *csrf_token.secret() {
             return Err(UvcadError::OAuthError("CSRF token mismatch".to_string()));
         }
 
         // Exchange authorization code for tokens
-        let pkce_verifier = self.pkce_verifier.lock().await.clone()
-            .ok_or_else(|| UvcadError::OAuthError("No PKCE verifier found".to_string()))?;
-
-        self.exchange_code(callback.code, pkce_verifier).await
-    }
-
-    async fn exchange_code(
-        &self,
-        code: String,
-        pkce_verifier: String,
-    ) -> Result<OAuthTokens> {
-        let client = self.oauth_client.as_ref()
-            .ok_or_else(|| UvcadError::OAuthError("OAuth client not initialized".to_string()))?;
-
         let token_result = client
-            .exchange_code(AuthorizationCode::new(code))
-            .set_pkce_verifier(PkceCodeVerifier::new(pkce_verifier))
+            .exchange_code(AuthorizationCode::new(callback.code))
+            .set_pkce_verifier(PkceCodeVerifier::new(pkce_verifier.secret().clone()))
             .request_async(async_http_client)
             .await
             .map_err(|e| UvcadError::OAuthError(format!("Token exchange failed: {}", e)))?;
@@ -119,30 +132,43 @@ impl AuthManager {
             }),
         };
 
-        // Store tokens securely
+        // Store tokens in keyring
         self.token_manager.store_tokens(&tokens)?;
+
+        // Store credentials in keyring for future token refresh
+        self.credential_manager.store_credentials(&OAuthCredentials {
+            client_id,
+            client_secret,
+        })?;
+
+        // Cache the client for immediate use
+        self.oauth_client = Some(client);
 
         tracing::info!("OAuth tokens obtained and stored successfully");
         Ok(tokens)
     }
 
-    pub async fn get_valid_token(&self) -> Result<String> {
-        let mut tokens = self.token_manager.get_tokens()?;
+    /// Get a valid access token, refreshing if expired.
+    pub async fn get_valid_token(&mut self) -> Result<String> {
+        let tokens = self.token_manager.get_tokens()?;
 
-        // Check if token is expired
+        // Check if token is expired or expiring within 5 minutes
         if let Some(expires_at) = tokens.expires_at {
             let now = chrono::Utc::now().timestamp();
-            // Refresh if token expires in less than 5 minutes
             if expires_at - now < 300 {
                 tracing::info!("Access token expired or expiring soon, refreshing...");
-                tokens = self.refresh_token(&tokens).await?;
+                let new_tokens = self.refresh_token(&tokens).await?;
+                return Ok(new_tokens.access_token);
             }
         }
 
         Ok(tokens.access_token)
     }
 
-    async fn refresh_token(&self, tokens: &OAuthTokens) -> Result<OAuthTokens> {
+    /// Refresh an expired token using stored credentials.
+    async fn refresh_token(&mut self, tokens: &OAuthTokens) -> Result<OAuthTokens> {
+        self.ensure_oauth_client()?;
+
         let client = self.oauth_client.as_ref()
             .ok_or_else(|| UvcadError::OAuthError("OAuth client not initialized".to_string()))?;
 
@@ -159,15 +185,13 @@ impl AuthManager {
             access_token: token_result.access_token().secret().clone(),
             refresh_token: token_result.refresh_token()
                 .map(|t| t.secret().clone())
-                .or_else(|| Some(refresh_token.clone())), // Keep old refresh token if not provided
+                .or_else(|| Some(refresh_token.clone())),
             expires_at: token_result.expires_in().map(|d| {
                 (chrono::Utc::now() + chrono::Duration::seconds(d.as_secs() as i64)).timestamp()
             }),
         };
 
-        // Store updated tokens
         self.token_manager.store_tokens(&new_tokens)?;
-
         tracing::info!("Access token refreshed successfully");
         Ok(new_tokens)
     }
@@ -177,6 +201,8 @@ impl AuthManager {
     }
 
     pub fn logout(&self) -> Result<()> {
-        self.token_manager.delete_tokens()
+        self.token_manager.delete_tokens()?;
+        let _ = self.credential_manager.delete_credentials();
+        Ok(())
     }
 }

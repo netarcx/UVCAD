@@ -42,3 +42,38 @@ impl TokenManager {
         self.entry.get_password().is_ok()
     }
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OAuthCredentials {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+pub struct CredentialManager {
+    entry: Entry,
+}
+
+impl CredentialManager {
+    pub fn new(provider: &str) -> Result<Self> {
+        let key = format!("{}_credentials", provider);
+        let entry = Entry::new(SERVICE_NAME, &key)?;
+        Ok(Self { entry })
+    }
+
+    pub fn store_credentials(&self, creds: &OAuthCredentials) -> Result<()> {
+        let json = serde_json::to_string(creds)?;
+        self.entry.set_password(&json)?;
+        Ok(())
+    }
+
+    pub fn get_credentials(&self) -> Result<OAuthCredentials> {
+        let json = self.entry.get_password()?;
+        let creds = serde_json::from_str(&json)?;
+        Ok(creds)
+    }
+
+    pub fn delete_credentials(&self) -> Result<()> {
+        self.entry.delete_password()?;
+        Ok(())
+    }
+}

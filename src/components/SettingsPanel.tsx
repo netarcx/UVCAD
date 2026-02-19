@@ -14,8 +14,6 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     smb_share_path: null,
   });
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
-  const [clientId, setClientId] = useState("");
-  const [clientSecret, setClientSecret] = useState("");
   const [authInProgress, setAuthInProgress] = useState(false);
 
   useEffect(() => {
@@ -68,98 +66,16 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
     }
   };
 
-  const handleImportCredentials = async () => {
-    try {
-      const selected = await open({
-        filters: [
-          {
-            name: "JSON",
-            extensions: ["json"],
-          },
-        ],
-        multiple: false,
-      });
-
-      if (!selected || typeof selected !== "string") {
-        return;
-      }
-
-      // Read the file
-      const { readTextFile } = await import("@tauri-apps/api/fs");
-      const content = await readTextFile(selected);
-
-      // Parse the JSON
-      const credentials = JSON.parse(content);
-
-      // Extract client_id and client_secret
-      // Google credentials JSON can have different formats
-      let extractedClientId = "";
-      let extractedClientSecret = "";
-
-      if (credentials.installed) {
-        extractedClientId = credentials.installed.client_id;
-        extractedClientSecret = credentials.installed.client_secret;
-      } else if (credentials.web) {
-        extractedClientId = credentials.web.client_id;
-        extractedClientSecret = credentials.web.client_secret;
-      } else if (credentials.client_id && credentials.client_secret) {
-        extractedClientId = credentials.client_id;
-        extractedClientSecret = credentials.client_secret;
-      } else {
-        alert("Invalid credentials file format. Please download the correct JSON file from Google Cloud Console.");
-        return;
-      }
-
-      if (!extractedClientId || !extractedClientSecret) {
-        alert("Could not find client_id and client_secret in the file.");
-        return;
-      }
-
-      setClientId(extractedClientId);
-      setClientSecret(extractedClientSecret);
-      console.log("Credentials imported successfully");
-      alert("Credentials imported successfully!");
-
-    } catch (error) {
-      console.error("Failed to import credentials:", error);
-      alert("Failed to import credentials: " + error);
-    }
-  };
-
   const handleGoogleAuth = async () => {
-    if (!clientId || !clientSecret) {
-      alert("Please enter both Client ID and Client Secret");
-      return;
-    }
-
     try {
       setAuthInProgress(true);
-
-      // Start OAuth flow
-      const message = await invoke<string>("start_google_auth", {
-        clientId,
-        clientSecret
-      });
-
-      console.log(message);
-
-      // Wait for user to complete auth in browser, then complete the flow
-      setTimeout(async () => {
-        try {
-          const result = await invoke<string>("complete_google_auth");
-          alert(result);
-          await loadAuthStatus();
-        } catch (error) {
-          console.error("Auth completion failed:", error);
-          alert("Authentication failed: " + error);
-        } finally {
-          setAuthInProgress(false);
-        }
-      }, 3000); // Give user 3 seconds to authorize in browser
-
+      const result = await invoke<string>("google_auth");
+      alert(result);
+      await loadAuthStatus();
     } catch (error) {
       console.error("Google auth failed:", error);
       alert("Authentication failed: " + error);
+    } finally {
       setAuthInProgress(false);
     }
   };
@@ -212,56 +128,14 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
           </div>
 
           {!authStatus?.is_authenticated && (
-            <>
-              <div className="setting-item">
-                <button
-                  onClick={handleImportCredentials}
-                  className="import-button"
-                  style={{ marginBottom: "1rem" }}
-                >
-                  📄 Import Credentials JSON
-                </button>
-                <span style={{ marginLeft: "1rem", fontSize: "0.9rem", color: "#666" }}>
-                  Or enter manually:
-                </span>
-              </div>
-              <div className="setting-item">
-                <label>Client ID:</label>
-                <input
-                  type="text"
-                  value={clientId}
-                  onChange={(e) => setClientId(e.target.value)}
-                  placeholder="Enter Google OAuth Client ID"
-                />
-              </div>
-              <div className="setting-item">
-                <label>Client Secret:</label>
-                <input
-                  type="password"
-                  value={clientSecret}
-                  onChange={(e) => setClientSecret(e.target.value)}
-                  placeholder="Enter Google OAuth Client Secret"
-                />
-              </div>
-              <div className="setting-item">
-                <button
-                  onClick={handleGoogleAuth}
-                  disabled={authInProgress || !clientId || !clientSecret}
-                >
-                  {authInProgress ? "Authenticating..." : "Connect to Google Drive"}
-                </button>
-              </div>
-              <div className="setting-help">
-                <p>ℹ️ To get OAuth credentials:</p>
-                <ol>
-                  <li>Go to <a href="https://console.cloud.google.com/" target="_blank">Google Cloud Console</a></li>
-                  <li>Create a project and enable Google Drive API</li>
-                  <li>Create OAuth 2.0 credentials (Desktop app)</li>
-                  <li>Set redirect URI to: http://127.0.0.1:8080/oauth/callback</li>
-                  <li>Download the JSON file or copy Client ID and Client Secret</li>
-                </ol>
-              </div>
-            </>
+            <div className="setting-item">
+              <button
+                onClick={handleGoogleAuth}
+                disabled={authInProgress}
+              >
+                {authInProgress ? "Authenticating..." : "Sign in with Google"}
+              </button>
+            </div>
           )}
 
           <div className="setting-item">
@@ -293,7 +167,7 @@ export default function SettingsPanel({ onClose }: SettingsPanelProps) {
         </section>
 
         <section className="settings-section">
-          <h3>⚠️ Deletion Safety</h3>
+          <h3>Deletion Safety</h3>
           <div className="setting-help">
             <p>
               <strong>Automatic protection against accidental large deletions:</strong>
