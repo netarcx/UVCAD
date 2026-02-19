@@ -178,7 +178,7 @@ function App() {
       </main>
 
       <footer className="app-footer">
-        <p>UVCAD v0.2.0 - CAD File Synchronization Tool</p>
+        <p>UVCAD v0.2.1 - CAD File Synchronization Tool</p>
       </footer>
     </div>
   );
